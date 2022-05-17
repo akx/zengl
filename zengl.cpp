@@ -15,6 +15,7 @@ struct ModuleState {
     PyTypeObject * Buffer_type;
     PyTypeObject * Image_type;
     PyTypeObject * Pipeline_type;
+    PyTypeObject * ImageFace_type;
     PyTypeObject * DescriptorSetBuffers_type;
     PyTypeObject * DescriptorSetImages_type;
     PyTypeObject * GlobalSettings_type;
@@ -159,6 +160,15 @@ struct Pipeline {
     Viewport viewport;
 };
 
+struct ImageFace {
+    PyObject_HEAD
+    Image * image;
+    int layer;
+    int level;
+    int samples;
+    int color;
+};
+
 void bind_descriptor_set_buffers(Context * self, DescriptorSetBuffers * set) {
     const GLMethods & gl = self->gl;
     if (self->current_buffers != set) {
@@ -289,8 +299,8 @@ GLObject * build_framebuffer(Context * self, PyObject * attachments) {
         return cache;
     }
 
-    PyObject * color_attachments = PyTuple_GetItem(attachments, 0);
-    PyObject * depth_stencil_attachment = PyTuple_GetItem(attachments, 1);
+    PyObject * color_attachments = PyTuple_GetItem(attachments, 1);
+    PyObject * depth_stencil_attachment = PyTuple_GetItem(attachments, 2);
 
     const GLMethods & gl = self->gl;
 
@@ -299,22 +309,22 @@ GLObject * build_framebuffer(Context * self, PyObject * attachments) {
     bind_framebuffer(self, framebuffer);
     int color_attachment_count = (int)PyTuple_Size(color_attachments);
     for (int i = 0; i < color_attachment_count; ++i) {
-        Image * image = (Image *)PyTuple_GetItem(color_attachments, i);
-        if (image->renderbuffer) {
-            gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, image->image);
+        ImageFace * face = (ImageFace *)PyTuple_GetItem(color_attachments, i);
+        if (face->image->renderbuffer) {
+            gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, face->image->image);
         } else {
-            gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, image->image, 0);
+            gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, face->image->image, face->level);
         }
     }
 
     if (depth_stencil_attachment != Py_None) {
-        Image * image = (Image *)depth_stencil_attachment;
-        int buffer = image->format.buffer;
+        ImageFace * face = (ImageFace *)depth_stencil_attachment;
+        int buffer = face->image->format.buffer;
         int attachment = buffer == GL_DEPTH ? GL_DEPTH_ATTACHMENT : buffer == GL_STENCIL ? GL_STENCIL_ATTACHMENT : GL_DEPTH_STENCIL_ATTACHMENT;
-        if (image->renderbuffer) {
-            gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, image->image);
+        if (face->image->renderbuffer) {
+            gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, face->image->image);
         } else {
-            gl.FramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, image->image, 0);
+            gl.FramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, face->image->image, face->level);
         }
     }
 
@@ -1222,13 +1232,14 @@ Pipeline * Context_meth_pipeline(Context * self, PyObject * vargs, PyObject * kw
     if (viewport != Py_None) {
         viewport_value = to_viewport(viewport);
     } else {
-        Image * first_image = (Image *)PySequence_GetItem(framebuffer_images, 0);
-        if (!first_image) {
-            return NULL;
-        }
-        viewport_value.width = (short)first_image->width;
-        viewport_value.height = (short)first_image->height;
-        Py_DECREF(first_image);
+        // ImageFace * face = NULL;
+        // if (PyTuple_Size(PyTuple_GetItem(attachments, 0))) {
+        //     face = (ImageFace *)PyTuple_GetItem(PyTuple_GetItem(attachments, 0), 0);
+        // } else {
+        //     face = (ImageFace *)PyTuple_GetItem(attachments, 1);
+        // }
+        viewport_value.width = (short)face->image->width;
+        viewport_value.height = (short)face->image->height;
     }
 
     Pipeline * res = PyObject_New(Pipeline, self->module_state->Pipeline_type);
@@ -1912,6 +1923,32 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
     Py_RETURN_NONE;
 }
 
+ImageFace * Image_meth_face(Image * self, PyObject * vargs, PyObject * kwargs) {
+    static char * keywords[] = {"layer", "level", NULL};
+
+    int layer = 0;
+    int level = 0;
+
+    if (!PyArg_ParseTupleAndKeywords(vargs, kwargs, "|ii", keywords, &layer, &level)) {
+        return NULL;
+    }
+
+    int max_levels = count_mipmaps(self->width, self->height);
+
+    if (layer < 0 || layer >= (self->array ? self->array : 1) * (self->cubemap ? 6 : 1) || level > max_levels) {
+        return NULL;
+    }
+
+    ImageFace * res = PyObject_New(ImageFace, self->ctx->module_state->ImageFace_type);
+    Py_INCREF(self);
+    res->image = self;
+    res->layer = layer;
+    res->level = level;
+    res->samples = self->samples;
+    res->color = self->format.color;
+    return res;
+}
+
 PyObject * Image_get_clear_value(Image * self) {
     if (self->format.clear_type == 'x') {
         return Py_BuildValue("fi", self->clear_value.clear_floats[0], self->clear_value.clear_ints[1]);
@@ -2089,6 +2126,16 @@ PyObject * meth_inspect(PyObject * self, PyObject * arg) {
         );
     }
     Py_RETURN_NONE;
+}
+
+PyObject * ImageFace_get_size(ImageFace * self) {
+    int width = self->image->width;
+    int height = self->image->height;
+    for (int i = 0; i < self->level; ++i) {
+        width >>= 1;
+        height >>= 1;
+    }
+    return Py_BuildValue("(ii)", width ? width : 1, height ? height : 1);
 }
 
 struct vec3 {
@@ -2352,6 +2399,10 @@ void Pipeline_dealloc(Pipeline * self) {
     Py_TYPE(self)->tp_free(self);
 }
 
+void ImageFace_dealloc(ImageFace * self) {
+    Py_TYPE(self)->tp_free(self);
+}
+
 void DescriptorSetBuffers_dealloc(DescriptorSetBuffers * self) {
     Py_TYPE(self)->tp_free(self);
 }
@@ -2404,6 +2455,7 @@ PyMethodDef Image_methods[] = {
     {"read", (PyCFunction)Image_meth_read, METH_VARARGS | METH_KEYWORDS, NULL},
     {"mipmaps", (PyCFunction)Image_meth_mipmaps, METH_VARARGS | METH_KEYWORDS, NULL},
     {"blit", (PyCFunction)Image_meth_blit, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"face", (PyCFunction)Image_meth_face, METH_VARARGS | METH_KEYWORDS, NULL},
     {},
 };
 
@@ -2437,6 +2489,20 @@ PyMemberDef Pipeline_members[] = {
     {},
 };
 
+PyMemberDef ImageFace_members[] = {
+    {"image", T_OBJECT_EX, offsetof(ImageFace, image), READONLY, NULL},
+    {"layer", T_INT, offsetof(ImageFace, layer), READONLY, NULL},
+    {"level", T_INT, offsetof(ImageFace, level), READONLY, NULL},
+    {"samples", T_INT, offsetof(ImageFace, samples), READONLY, NULL},
+    {"color", T_BOOL, offsetof(ImageFace, color), READONLY, NULL},
+    {},
+};
+
+PyGetSetDef ImageFace_getset[] = {
+    {"size", (getter)ImageFace_get_size, NULL, NULL, NULL},
+    {},
+};
+
 PyType_Slot Context_slots[] = {
     {Py_tp_methods, Context_methods},
     {Py_tp_members, Context_members},
@@ -2467,6 +2533,13 @@ PyType_Slot Pipeline_slots[] = {
     {},
 };
 
+PyType_Slot ImageFace_slots[] = {
+    {Py_tp_members, ImageFace_members},
+    {Py_tp_getset, ImageFace_getset},
+    {Py_tp_dealloc, (void *)ImageFace_dealloc},
+    {},
+};
+
 PyType_Slot DescriptorSetBuffers_slots[] = {
     {Py_tp_dealloc, (void *)DescriptorSetBuffers_dealloc},
     {},
@@ -2491,6 +2564,7 @@ PyType_Spec Context_spec = {"zengl.Context", sizeof(Context), 0, Py_TPFLAGS_DEFA
 PyType_Spec Buffer_spec = {"zengl.Buffer", sizeof(Buffer), 0, Py_TPFLAGS_DEFAULT, Buffer_slots};
 PyType_Spec Image_spec = {"zengl.Image", sizeof(Image), 0, Py_TPFLAGS_DEFAULT, Image_slots};
 PyType_Spec Pipeline_spec = {"zengl.Pipeline", sizeof(Pipeline), 0, Py_TPFLAGS_DEFAULT, Pipeline_slots};
+PyType_Spec ImageFace_spec = {"zengl.ImageFace", sizeof(ImageFace), 0, Py_TPFLAGS_DEFAULT, ImageFace_slots};
 PyType_Spec DescriptorSetBuffers_spec = {"zengl.DescriptorSetBuffers", sizeof(DescriptorSetBuffers), 0, Py_TPFLAGS_DEFAULT, DescriptorSetBuffers_slots};
 PyType_Spec DescriptorSetImages_spec = {"zengl.DescriptorSetImages", sizeof(DescriptorSetImages), 0, Py_TPFLAGS_DEFAULT, DescriptorSetImages_slots};
 PyType_Spec GlobalSettings_spec = {"zengl.GlobalSettings", sizeof(GlobalSettings), 0, Py_TPFLAGS_DEFAULT, GlobalSettings_slots};
@@ -2513,6 +2587,7 @@ int module_exec(PyObject * self) {
     state->Buffer_type = (PyTypeObject *)PyType_FromSpec(&Buffer_spec);
     state->Image_type = (PyTypeObject *)PyType_FromSpec(&Image_spec);
     state->Pipeline_type = (PyTypeObject *)PyType_FromSpec(&Pipeline_spec);
+    state->ImageFace_type = (PyTypeObject *)PyType_FromSpec(&ImageFace_spec);
     state->DescriptorSetBuffers_type = (PyTypeObject *)PyType_FromSpec(&DescriptorSetBuffers_spec);
     state->DescriptorSetImages_type = (PyTypeObject *)PyType_FromSpec(&DescriptorSetImages_spec);
     state->GlobalSettings_type = (PyTypeObject *)PyType_FromSpec(&GlobalSettings_spec);
@@ -2558,6 +2633,7 @@ void module_free(PyObject * self) {
     Py_DECREF(state->Buffer_type);
     Py_DECREF(state->Image_type);
     Py_DECREF(state->Pipeline_type);
+    Py_DECREF(state->ImageFace_type);
     Py_DECREF(state->DescriptorSetBuffers_type);
     Py_DECREF(state->DescriptorSetImages_type);
     Py_DECREF(state->GlobalSettings_type);
