@@ -136,6 +136,7 @@ struct Image {
     int cubemap;
     int target;
     int renderbuffer;
+    int layers;
     int max_level;
 };
 
@@ -299,8 +300,12 @@ GLObject * build_framebuffer(Context * self, PyObject * attachments) {
     bind_framebuffer(self, framebuffer);
     int color_attachment_count = (int)PyTuple_Size(color_attachments);
     for (int i = 0; i < color_attachment_count; ++i) {
-        Image * image = (Image *)PyTuple_GetItem(color_attachments, i);
-        if (image->renderbuffer) {
+        PyObject * tup = PyTuple_GetItem(color_attachments, i);
+        Image * image = (Image *)PyTuple_GetItem(tup, 0);
+        if (image->array || image->cubemap) {
+            int layer = PyLong_AsLong(PyTuple_GetItem(tup, 1));
+            // gl.FramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, image->image, 0, layer);
+        } else if (image->renderbuffer) {
             gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, image->image);
         } else {
             gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE_2D, image->image, 0);
@@ -308,10 +313,13 @@ GLObject * build_framebuffer(Context * self, PyObject * attachments) {
     }
 
     if (depth_stencil_attachment != Py_None) {
-        Image * image = (Image *)depth_stencil_attachment;
+        Image * image = (Image *)PyTuple_GetItem(depth_stencil_attachment, 0);
         int buffer = image->format.buffer;
         int attachment = buffer == GL_DEPTH ? GL_DEPTH_ATTACHMENT : buffer == GL_STENCIL ? GL_STENCIL_ATTACHMENT : GL_DEPTH_STENCIL_ATTACHMENT;
-        if (image->renderbuffer) {
+        if (image->array || image->cubemap) {
+            int layer = PyLong_AsLong(PyTuple_GetItem(depth_stencil_attachment, 1));
+            // gl.FramebufferTextureLayer(GL_FRAMEBUFFER, attachment, image->image, 0, layer);
+        } else if (image->renderbuffer) {
             gl.FramebufferRenderbuffer(GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, image->image);
         } else {
             gl.FramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_2D, image->image, 0);
@@ -889,6 +897,7 @@ Image * Context_meth_image(Context * self, PyObject * vargs, PyObject * kwargs) 
 
     int renderbuffer = samples > 1 || texture == Py_False;
     int target = cubemap ? GL_TEXTURE_CUBE_MAP : array ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    int layers = (array ? array : 1) * (cubemap ? 6 : 1);
 
     if (samples > self->max_samples) {
         samples = self->max_samples;
@@ -961,16 +970,31 @@ Image * Context_meth_image(Context * self, PyObject * vargs, PyObject * kwargs) 
     res->cubemap = cubemap;
     res->target = target;
     res->renderbuffer = renderbuffer;
+    res->layers = layers;
     res->max_level = 0;
 
     res->framebuffer = NULL;
-    if (!cubemap && !array) {
+    if (array || cubemap && layers <= 8) {
+        // PyObject * pairs = PyTuple_New(layers);
+        // for (int i = 0; i < layers; ++i) {
+        //     PyTuple_SetItem(pairs, i, Py_BuildValue("(Oi)", res, i));
+        // }
+        // if (format.color) {
+        //     PyObject * attachments = Py_BuildValue("N(OO))", pairs, Py_None, Py_None);
+        //     res->framebuffer = build_framebuffer(self, attachments);
+        //     Py_DECREF(attachments);
+        // } else {
+        //     PyObject * attachments = Py_BuildValue("(()N)", pairs);
+        //     res->framebuffer = build_framebuffer(self, attachments);
+        //     Py_DECREF(attachments);
+        // }
+    } else {
         if (format.color) {
-            PyObject * attachments = Py_BuildValue("((O)O)", res, Py_None);
+            PyObject * attachments = Py_BuildValue("(((OO))(OO))", res, Py_None, Py_None, Py_None);
             res->framebuffer = build_framebuffer(self, attachments);
             Py_DECREF(attachments);
         } else {
-            PyObject * attachments = Py_BuildValue("(()O)", res);
+            PyObject * attachments = Py_BuildValue("(()(OO))", res, Py_None);
             res->framebuffer = build_framebuffer(self, attachments);
             Py_DECREF(attachments);
         }
@@ -1938,6 +1962,13 @@ PyObject * Image_get_clear_value(Image * self) {
     return res;
 }
 
+PyObject * Image_get_layers(Image * self) {
+    if (self->cubemap || self->array) {
+        return PyLong_FromLong(self->layers);
+    }
+    Py_RETURN_NONE;
+}
+
 int Image_set_clear_value(Image * self, PyObject * value) {
     ClearValue clear_value = {};
     if (self->format.components == 1) {
@@ -2409,6 +2440,7 @@ PyMethodDef Image_methods[] = {
 
 PyGetSetDef Image_getset[] = {
     {"clear_value", (getter)Image_get_clear_value, (setter)Image_set_clear_value, NULL, NULL},
+    {"layers", (getter)Image_get_layers, NULL, NULL, NULL},
     {},
 };
 

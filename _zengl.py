@@ -216,18 +216,25 @@ def sampler_bindings(resources):
 
 
 def framebuffer_attachments(attachments):
-    size = attachments[0].size
-    samples = attachments[0].samples
-    for attachment in attachments:
+    attachments = [(x['image'], x.get('layer', None)) if isinstance(x, dict) else (x, None) for x in attachments]
+    size = attachments[0][0].size
+    samples = attachments[0][0].samples
+    for attachment, layer in attachments:
         if attachment.size != size:
             raise ValueError('Attachments must be images with the same size')
         if attachment.samples != samples:
             raise ValueError('Attachments must be images with the same number of samples')
-    depth_stencil_attachment = None
-    if not attachments[-1].color:
+        if attachment.layers and layer is None:
+            raise ValueError('Layered images must be attached with the layer specified')
+        if not attachment.layers and layer is not None:
+            raise ValueError('Simple images must be attached without the layer specified')
+        if layer < 0 or layer >= attachment.layers:
+            raise ValueError('Invalid layer')
+    depth_stencil_attachment = (None, None)
+    if not attachments[-1][0].color:
         depth_stencil_attachment = attachments[-1]
         attachments = attachments[:-1]
-    for attachment in attachments:
+    for attachment, _ in attachments:
         if not attachment.color:
             raise ValueError('The depth stencil attachments must be the last item in the framebuffer')
     return tuple(attachments), depth_stencil_attachment
