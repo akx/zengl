@@ -136,6 +136,7 @@ struct Image {
     int cubemap;
     int target;
     int renderbuffer;
+    int current_layer;
     int max_level;
 };
 
@@ -962,6 +963,7 @@ Image * Context_meth_image(Context * self, PyObject * vargs, PyObject * kwargs) 
     res->cubemap = cubemap;
     res->target = target;
     res->renderbuffer = renderbuffer;
+    res->current_layer = 0;
     res->max_level = 0;
 
     res->framebuffer = NULL;
@@ -975,6 +977,18 @@ Image * Context_meth_image(Context * self, PyObject * vargs, PyObject * kwargs) 
             res->framebuffer = build_framebuffer(self, attachments);
             Py_DECREF(attachments);
         }
+    } else {
+        int framebuffer = 0;
+        gl.GenFramebuffers(1, (unsigned *)&framebuffer);
+        bind_framebuffer(self, framebuffer);
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X, image, 0);
+        // gl.FramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, image, 0, 0);
+        unsigned draw_buffer = GL_COLOR_ATTACHMENT0;
+        gl.DrawBuffers(1, &draw_buffer);
+        gl.ReadBuffer(GL_COLOR_ATTACHMENT0);
+        res->framebuffer = PyObject_New(GLObject, self->module_state->GLObject_type);
+        res->framebuffer->obj = framebuffer;
+        res->framebuffer->uses = 1;
     }
 
     if (data != Py_None) {
@@ -1782,11 +1796,12 @@ PyObject * Image_meth_read(Image * self, PyObject * vargs, PyObject * kwargs) {
 }
 
 PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
-    static char * keywords[] = {"target", "target_viewport", "source_viewport", "filter", "srgb", "flush", NULL};
+    static char * keywords[] = {"target", "target_viewport", "source_viewport", "target_layer", "filter", "srgb", "flush", NULL};
 
     PyObject * target_arg = Py_None;
     PyObject * target_viewport_arg = Py_None;
     PyObject * source_viewport_arg = Py_None;
+    PyObject * target_layer_arg = Py_None;
     int filter = true;
     PyObject * srgb_arg = Py_None;
     PyObject * flush_arg = Py_None;
@@ -1794,11 +1809,12 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
     int args_ok = PyArg_ParseTupleAndKeywords(
         vargs,
         kwargs,
-        "|OO$OpOO",
+        "|OO$OOpOO",
         keywords,
         &target_arg,
         &target_viewport_arg,
         &source_viewport_arg,
+        &target_layer_arg,
         &filter,
         &srgb_arg,
         &flush_arg
@@ -1819,6 +1835,7 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
 
     const bool invalid_target_viewport_type = target_viewport_arg != Py_None && !is_viewport(target_viewport_arg);
     const bool invalid_source_viewport_type = source_viewport_arg != Py_None && !is_viewport(source_viewport_arg);
+    const bool invalid_target_layer_type = target_layer_arg != Py_None && !PyLong_CheckExact(target_layer_arg);
 
     if (target_viewport_arg != Py_None && !invalid_target_viewport_type) {
         target_viewport = to_viewport(target_viewport_arg);
@@ -1847,13 +1864,20 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
         source_viewport.x + source_viewport.width > self->width || source_viewport.y + source_viewport.height > self->height
     );
 
-    const bool invalid_target = target && (target->cubemap || target->array || !target->format.color || target->samples > 1);
+    const bool invalid_target = target && (!target->format.color || target->samples > 1);
     const bool invalid_source = self->cubemap || self->array || !self->format.color;
+    const bool invalid_target_layer = invalid_target_layer_type || (
+        (target && (target->cubemap || target->array)) ? target_layer_arg == Py_None : target_layer_arg != Py_None
+    );
+
+    int target_layer = 0;
+    if (target_layer_arg != Py_None && !invalid_target_layer_type) {
+        target_layer = PyLong_AsLong(target_layer_arg);
+    }
 
     const bool error = (
         invalid_target_type || invalid_srgb_parameter || invalid_flush_parameter ||
-        invalid_target_viewport_type || invalid_source_viewport_type || invalid_target_viewport ||
-        invalid_source_viewport || invalid_target || invalid_source
+        invalid_target_viewport || invalid_source_viewport || invalid_target || invalid_source || invalid_target_layer
     );
 
     if (error) {
@@ -1877,14 +1901,12 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
             PyErr_Format(PyExc_TypeError, "cannot blit array images");
         } else if (!self->format.color) {
             PyErr_Format(PyExc_TypeError, "cannot blit depth or stencil images");
-        } else if (target && target->cubemap) {
-            PyErr_Format(PyExc_TypeError, "cannot blit to cubemap images");
-        } else if (target && target->array) {
-            PyErr_Format(PyExc_TypeError, "cannot blit to array images");
         } else if (target && !target->format.color) {
             PyErr_Format(PyExc_TypeError, "cannot blit to depth or stencil images");
         } else if (target && target->samples > 1) {
             PyErr_Format(PyExc_TypeError, "cannot blit to multisampled images");
+        } else if (invalid_target_layer) {
+            PyErr_Format(PyExc_ValueError, "invalid target layer parameter");
         }
         return NULL;
     }
@@ -1898,6 +1920,12 @@ PyObject * Image_meth_blit(Image * self, PyObject * vargs, PyObject * kwargs) {
         self->ctx->current_clear_mask |= 0xf;
         self->ctx->current_global_settings = NULL;
         gl.ColorMaski(0, 1, 1, 1, 1);
+    }
+    if (target && (target->array || target->cubemap) && target->current_layer != target_layer) {
+        gl.BindFramebuffer(GL_FRAMEBUFFER, target->framebuffer->obj);
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + target_layer, target->image, 0);
+        target->current_layer = target_layer;
+        // gl.FramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target->image, 0, target_layer);
     }
     gl.BindFramebuffer(GL_READ_FRAMEBUFFER, self->framebuffer->obj);
     gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, target ? target->framebuffer->obj : self->ctx->screen);
